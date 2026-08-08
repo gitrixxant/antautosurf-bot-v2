@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# bot_worker.py - BOT MULTI-ACCOUNT IBRIDO INTELLIGENTE
+# bot_worker.py - BOT MULTI-ACCOUNT IBRIDO INTELLIGENTE (VERSIONE FINALE)
 
 import os
 import time
@@ -173,14 +173,14 @@ FALLIMENTI_PROXY = {}  # { "account": count }
 
 def ottieni_proxy_ibrido(email, proxy_pool, used_proxies):
     """
-    Sistema ibrido con soglia di fallimenti:
-    1. Prima prova 1 proxy PUBBLICO
-    2. Se fallisce → usa proxy PROXYSCRAPE
+    Sistema ibrido:
+    1. Prova 1 proxy PUBBLICO
+    2. Se fallisce → usa proxy PROXYSCRAPE (permanentemente)
     """
     
     fallimenti = FALLIMENTI_PROXY.get(email, 0)
     
-    # 🔥 SE HA GIà FALLITO 1 VOLTA, USA DIRETTAMENTE PROXYSCRAPE
+    # 🔥 SE HA GIÀ FALLITO 1 VOLTA, USA DIRETTAMENTE PROXYSCRAPE
     if fallimenti >= 1:
         print(f"[{email[:10]}...] ⚠️ Già fallito 1 volta, passo a ProxyScrape...")
         
@@ -216,6 +216,7 @@ def ottieni_proxy_ibrido(email, proxy_pool, used_proxies):
             "string": f"{proxy_pubblico['host']}:{proxy_pubblico['port']}"
         }
     else:
+        # Se non trova proxy, incrementa e riprova
         FALLIMENTI_PROXY[email] = 1
         print(f"[{email[:10]}...] ⚠️ Nessun proxy pubblico disponibile, passo a ProxyScrape...")
         return None
@@ -377,9 +378,10 @@ def esegui_account(account_data, proxy_pool):
                 log(email, "⚠️ CAPTCHA RILEVATO!")
                 if not risolvi_captcha(page, email, phash_db):
                     log(email, "❌ Captcha non risolto!")
-                    # Se captcha non risolto, segna come fallito
+                    # 🔥 Se captcha non risolto e proxy pubblico, incrementa contatore
                     if proxy_type == "public":
                         FALLIMENTI_PROXY[email] = FALLIMENTI_PROXY.get(email, 0) + 1
+                        log(email, f"⚠️ Proxy pubblico fallito ({FALLIMENTI_PROXY[email]}/1)")
                     return
             
             balance_match = re.search(r'btoday["\']?\s*[=:]\s*([\d.]+)', html)
@@ -389,8 +391,10 @@ def esegui_account(account_data, proxy_pool):
             csrf_match = re.search(r'csrf_token=([a-f0-9]+)', html)
             if not csrf_match:
                 log(email, "❌ CSRF non trovato!")
+                # 🔥 Se CSRF non trovato e proxy pubblico, incrementa contatore
                 if proxy_type == "public":
                     FALLIMENTI_PROXY[email] = FALLIMENTI_PROXY.get(email, 0) + 1
+                    log(email, f"⚠️ Proxy pubblico fallito ({FALLIMENTI_PROXY[email]}/1)")
                 return
             
             csrf = csrf_match.group(1)
@@ -443,8 +447,10 @@ def esegui_account(account_data, proxy_pool):
                     
                     if csrf_invalidi >= MAX_CSRF_INVALIDI:
                         log(email, "🔄 Troppi CSRF invalidi!")
+                        # 🔥 Se troppi CSRF invalidi e proxy pubblico, incrementa contatore
                         if proxy_type == "public":
                             FALLIMENTI_PROXY[email] = FALLIMENTI_PROXY.get(email, 0) + 1
+                            log(email, f"⚠️ Proxy pubblico fallito ({FALLIMENTI_PROXY[email]}/1)")
                         return
                     
                     page.goto(f"https://antautosurf.com/index.php?bitcoinwallet={email}&ref=", wait_until="networkidle", timeout=30000)
@@ -481,6 +487,7 @@ def esegui_account(account_data, proxy_pool):
                     print("   " * 20, end="\r")
                     continue
                 
+                # 🔥 ANNUNCIO REALE TROVATO!
                 log(email, f"   📢 Annuncio reale! Timer: {time_val}s")
                 surf_successo = True
                 
@@ -513,14 +520,17 @@ def esegui_account(account_data, proxy_pool):
             
             log(email, f"✅ Completati {MAX_CYCLES} cicli, passo al prossimo account")
             
-            # Se ha funzionato con proxy pubblico, resetta il contatore
+            # 🔥 Se ha funzionato con proxy pubblico, resetta il contatore
             if proxy_type == "public" and surf_successo:
                 FALLIMENTI_PROXY[email] = 0
+                log(email, f"✅ Proxy pubblico funzionante! Contatore resettato")
             
         except Exception as e:
             log(email, f"❌ Errore: {e}")
+            # 🔥 Se errore e proxy pubblico, incrementa contatore
             if proxy_type == "public":
                 FALLIMENTI_PROXY[email] = FALLIMENTI_PROXY.get(email, 0) + 1
+                log(email, f"⚠️ Proxy pubblico fallito ({FALLIMENTI_PROXY[email]}/1)")
         finally:
             browser.close()
 
