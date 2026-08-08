@@ -171,6 +171,27 @@ def trova_proxy_pubblico_libero():
 
 FALLIMENTI_PROXY = {}  # { "account": count }
 
+def ottieni_proxy_solo_proxyscrape(email, proxy_pool, used_proxies):
+    """Usa SOLO proxy ProxyScrape"""
+    if not proxy_pool:
+        return None
+    
+    for proxy in proxy_pool:
+        if proxy["account"] == email and proxy["proxy"] not in used_proxies:
+            proxy_config = parse_proxy(proxy["proxy"])
+            if proxy_config:
+                print(f"[{email[:10]}...] ✅ Proxy ProxyScrape: {proxy['proxy'].split('@')[1]}")
+                segna_proxy_usato(proxy['proxy'])
+                used_proxies.append(proxy['proxy'])
+                return {
+                    "type": "proxyscrape",
+                    "proxy": proxy["proxy"],
+                    "config": proxy_config,
+                    "string": proxy["proxy"]
+                }
+    
+    return None
+
 def ottieni_proxy_ibrido(email, proxy_pool, used_proxies):
     """
     Sistema ibrido:
@@ -535,7 +556,7 @@ def esegui_account(account_data, proxy_pool):
             browser.close()
 
 # ============================================================
-# MAIN
+# MAIN - CON GESTIONE PERSISTENTE DEI FALLIMENTI
 # ============================================================
 
 def main():
@@ -561,11 +582,245 @@ def main():
     print("🔄 2. Se fallisce → usa proxy PROXYSCRAPE (permanentemente)")
     print("="*60)
     
+    # 🔥 RESETTA I CONTATORI ALL'INIZIO
+    global FALLIMENTI_PROXY
+    FALLIMENTI_PROXY = {}
+    
     while True:
         for account in accounts:
-            esegui_account(account, proxy_pool)
+            email = account["email"]
+            used_proxies = []
+            
+            # 🔥 SE HA GIA' FALLITO, USA PROXYSCRAPE DIRETTAMENTE
+            if FALLIMENTI_PROXY.get(email, 0) >= 1:
+                print(f"[{email[:10]}...] ⚠️ Già fallito, uso ProxyScrape...")
+                proxy_data = ottieni_proxy_solo_proxyscrape(email, proxy_pool, used_proxies)
+                if proxy_data:
+                    # Esegui con ProxyScrape
+                    esegui_account_con_proxy(account, proxy_data, proxy_pool)
+                else:
+                    print(f"[{email[:10]}...] ❌ Nessun proxy ProxyScrape disponibile!")
+                    # Aspetta prima di riprovare
+                    time.sleep(10)
+            else:
+                # Prova con proxy pubblico
+                esegui_account(account, proxy_pool)
+            
             time.sleep(5)
             print("─" * 60)
+
+# ============================================================
+# ESEGUI ACCOUNT CON PROXY PREDEFINITO
+# ============================================================
+
+def esegui_account_con_proxy(account_data, proxy_data, proxy_pool):
+    """Esegue un account con un proxy già assegnato"""
+    email = account_data["email"]
+    password = account_data["password"]
+    
+    log(email, "🚀 Avvio account (ProxyScrape)...")
+    
+    proxy_config = proxy_data["config"]
+    proxy_str = proxy_data["string"]
+    proxy_type = proxy_data["type"]
+    
+    log(email, f"🌐 Proxy: {proxy_str} ({proxy_type})")
+    
+    phash_db = carica_database()
+    surf_successo = False
+    
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=HEADLESS,
+            proxy=proxy_config,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            ]
+        )
+        
+        context = browser.new_context()
+        page = context.new_page()
+        
+        try:
+            # LOGIN
+            log(email, "📧 Login...")
+            page.goto("https://antautosurf.com/", wait_until="domcontentloaded", timeout=30000)
+            time.sleep(2)
+            
+            page.fill('input[name="bitcoinwallet"]', email)
+            page.click('input[type="submit"][value*="Enter"]')
+            time.sleep(3)
+            
+            html = page.content()
+            
+            if "Set Login Password" in html:
+                log(email, "📝 Nuovo account! Registro...")
+                page.fill('input[name="password"]', password)
+                page.fill('input[name="passwordb"]', password)
+                match = re.search(r'name="confirm2" value="(\d+)"', html)
+                if match:
+                    confirm2 = match.group(1)
+                    page.goto(f"https://antautosurf.com/index.php?password={password}&passwordb={password}&confirm2={confirm2}")
+                    time.sleep(3)
+                    log(email, "   ✅ Password impostata!")
+                    html = page.content()
+            
+            if "Please enter Password" in html:
+                log(email, "🔑 Login con password...")
+                page.fill('input[name="password"]', password)
+                page.click('input[value="Enter"]')
+                time.sleep(3)
+            
+            log(email, "✅ Login completato!")
+            
+            # DASHBOARD
+            log(email, "📊 Dashboard...")
+            page.goto(f"https://antautosurf.com/index.php?bitcoinwallet={email}&ref=", wait_until="networkidle", timeout=30000)
+            time.sleep(3)
+            html = page.content()
+            
+            if "Please Click Similar" in html:
+                log(email, "⚠️ CAPTCHA RILEVATO!")
+                if not risolvi_captcha(page, email, phash_db):
+                    log(email, "❌ Captcha non risolto!")
+                    return
+            
+            balance_match = re.search(r'btoday["\']?\s*[=:]\s*([\d.]+)', html)
+            if balance_match:
+                log(email, f"💰 Balance: {balance_match.group(1)}")
+            
+            csrf_match = re.search(r'csrf_token=([a-f0-9]+)', html)
+            if not csrf_match:
+                log(email, "❌ CSRF non trovato!")
+                return
+            
+            csrf = csrf_match.group(1)
+            log(email, f"🎫 CSRF: {csrf[:16]}...")
+            
+            # SURF
+            log(email, "🚀 Avvio surf...")
+            
+            key = ""
+            time_val = 12
+            ad_id = ""
+            cycle = 0
+            MAX_CYCLES = 10
+            csrf_invalidi = 0
+            MAX_CSRF_INVALIDI = 5
+            
+            while cycle < MAX_CYCLES:
+                cycle += 1
+                log(email, f"🔄 CICLO {cycle}")
+                
+                if ad_id:
+                    ad_id_pulito = re.sub(r'<[^>]+>', '', ad_id)
+                    ad_id_pulito = re.sub(r'[<>\'"]', '', ad_id_pulito)
+                    match = re.search(r'(\d+)', ad_id_pulito)
+                    ad_id_pulito = match.group(1) if match else ""
+                else:
+                    ad_id_pulito = ""
+                
+                params = {
+                    "wallet": email,
+                    "key": key,
+                    "time": time_val,
+                    "ad_id": ad_id_pulito,
+                    "isitbad": 0,
+                    "csrf_token": csrf
+                }
+                
+                url = "https://antautosurf.com/surf.php?" + "&".join([f"{k}={v}" for k, v in params.items()])
+                
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                except:
+                    continue
+                
+                page_text = page.content()
+                
+                if "Invalid CSRF token" in page_text:
+                    csrf_invalidi += 1
+                    log(email, f"❌ CSRF invalido! ({csrf_invalidi}/{MAX_CSRF_INVALIDI})")
+                    
+                    if csrf_invalidi >= MAX_CSRF_INVALIDI:
+                        log(email, "🔄 Troppi CSRF invalidi!")
+                        return
+                    
+                    page.goto(f"https://antautosurf.com/index.php?bitcoinwallet={email}&ref=", wait_until="networkidle", timeout=30000)
+                    time.sleep(2)
+                    html = page.content()
+                    csrf_match = re.search(r'csrf_token=([a-f0-9]+)', html)
+                    if csrf_match:
+                        csrf = csrf_match.group(1)
+                        csrf_invalidi = 0
+                        log(email, f"🎫 Nuovo CSRF: {csrf[:16]}...")
+                    continue
+                else:
+                    csrf_invalidi = 0
+                
+                if "--_--" not in page_text:
+                    time.sleep(5)
+                    continue
+                
+                parts = page_text.split("--_--")
+                if len(parts) < 4:
+                    continue
+                
+                ad_url = re.sub(r'<[^>]+>', '', parts[0]).strip()
+                ad_url = re.sub(r'[<>\'"]', '', ad_url)
+                time_val = int(parts[1])
+                key = parts[2]
+                ad_id = parts[3]
+                
+                if "connection.php" in ad_url:
+                    log(email, "   📂 Test anti-bot...")
+                    for i in range(time_val, 0, -1):
+                        print(f"[{email[:10]}] ⏳ {i}s", end="\r")
+                        time.sleep(1)
+                    print("   " * 20, end="\r")
+                    continue
+                
+                log(email, f"   📢 Annuncio reale! Timer: {time_val}s")
+                surf_successo = True
+                
+                try:
+                    new_page = context.new_page()
+                    new_page.goto(ad_url, wait_until="domcontentloaded", timeout=10000)
+                    time.sleep(1)
+                except:
+                    pass
+                
+                for i in range(time_val, 0, -1):
+                    print(f"[{email[:10]}] ⏳ {i}s", end="\r")
+                    time.sleep(1)
+                print("   " * 20, end="\r")
+                log(email, f"   ✅ Timer completato!")
+                
+                try:
+                    new_page.close()
+                except:
+                    pass
+                
+                if cycle % 3 == 0:
+                    page.goto(f"https://antautosurf.com/index.php?bitcoinwallet={email}&ref=", wait_until="networkidle", timeout=30000)
+                    time.sleep(2)
+                    html = page.content()
+                    csrf_match = re.search(r'csrf_token=([a-f0-9]+)', html)
+                    if csrf_match:
+                        csrf = csrf_match.group(1)
+                        log(email, f"   🎫 CSRF aggiornato: {csrf[:16]}...")
+            
+            log(email, f"✅ Completati {MAX_CYCLES} cicli, passo al prossimo account")
+            
+        except Exception as e:
+            log(email, f"❌ Errore: {e}")
+        finally:
+            browser.close()
+
+# ============================================================
+# AVVIO
+# ============================================================
 
 if __name__ == "__main__":
     try:
